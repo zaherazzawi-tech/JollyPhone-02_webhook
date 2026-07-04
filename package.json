@@ -1,0 +1,12 @@
+{
+  "name": "vapi-intake-webhook",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "vapi-intake-webhook.js",
+  "scripts": {
+    "start": "node vapi-intake-webhook.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

@@ -46,11 +46,23 @@ app.post("/vapi-intake", async (req, res) => {
       return res.status(200).send("ignored");
     }
 
-    // Vapi puts parsed structured output under analysis.structuredData
-    const data =
-      message?.analysis?.structuredData ??
-      message?.structuredData ??
-      {};
+    // Vapi nests structured outputs under a dynamic ID key:
+    //   structuredOutputs: { "<uuid>": { name, result: { ...fields } } }
+    // Grab the first output's `result`. Fall back to older paths just in case.
+    function extractData(msg) {
+      const so =
+        msg?.artifact?.structuredOutputs ??
+        msg?.structuredOutputs ??
+        msg?.analysis?.structuredOutputs;
+      if (so && typeof so === "object") {
+        const first = Object.values(so)[0];
+        if (first?.result) return first.result;
+      }
+      // Legacy / alternate shapes
+      return msg?.analysis?.structuredData ?? msg?.structuredData ?? {};
+    }
+
+    const data = extractData(message);
 
     const recordingUrl =
       message?.recordingUrl ?? message?.artifact?.recordingUrl ?? "";
@@ -114,8 +126,12 @@ async function sendSlack({ data, matter, isUrgent, recordingUrl }) {
 async function sendEmail({ data, matter, isUrgent, recordingUrl, transcript }) {
   if (!RESEND_API_KEY || !INTAKE_EMAIL_TO || !INTAKE_EMAIL_FROM) return;
 
-  const questions = Array.isArray(data.open_questions_for_attorney)
-    ? data.open_questions_for_attorney
+  // open_questions_for_attorney may come back as an array OR a plain string
+  const rawQuestions = data.open_questions_for_attorney;
+  const questions = Array.isArray(rawQuestions)
+    ? rawQuestions
+    : rawQuestions
+    ? [rawQuestions]
     : [];
 
   const subject =

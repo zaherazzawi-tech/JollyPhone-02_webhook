@@ -11,6 +11,7 @@
 //   INTAKE_EMAIL_TO, SLACK_WEBHOOK_URL  (fallback if a client has no entry below)
 
 import express from "express";
+import { storeCall } from "./supabase-store.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -101,6 +102,9 @@ app.post("/vapi-intake", async (req, res) => {
       sendSlack({ client, kind, data, isUrgent, recordingUrl, assistantName }),
       sendEmail({ client, kind, data, isUrgent, recordingUrl, transcript, assistantName }),
     ]);
+
+    // Additive: persist the call. Never throws; email/Slack above are unaffected.
+    await storeCall({ message, data, clientId, agentType: kind });
 
     return res.status(200).send("ok");
   } catch (err) {

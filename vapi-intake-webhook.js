@@ -83,12 +83,29 @@ app.post("/vapi-intake", async (req, res) => {
     // ---- which client is this? ----
     // Set `client_id` as assistant metadata / a variable value in Vapi.
     // We look in the common places Vapi surfaces it.
-    const clientId =
+    const payloadClientId =
       message?.assistant?.metadata?.client_id ??
       message?.call?.assistantOverrides?.variableValues?.client_id ??
       message?.assistant?.variableValues?.client_id ??
       data.client_id ??
       null;
+
+    // Fallback: ?client_id=... on the Server URL, for assistants that can't
+    // set metadata. Payload always wins; blank/whitespace counts as missing.
+    const cleanId = (v) => {
+      const s = Array.isArray(v) ? v[0] : v;
+      return s == null ? "" : String(s).trim();
+    };
+    const fromPayload = cleanId(payloadClientId);
+    const fromQuery = cleanId(req.query?.client_id);
+    const clientId = fromPayload || fromQuery || null;
+
+    console.log(
+      clientId
+        ? `[client] resolved '${clientId}' from ${fromPayload ? "payload" : "query"}`
+        : "[client] no client_id in payload or query — using fallback destination"
+    );
+
     const client = resolveClient(clientId);
 
     // ---- which agent type sent this ----

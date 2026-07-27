@@ -2,7 +2,8 @@
 //   • Immigration agent  (fields: matter_type, matter_summary, detained, ...)
 //   • General/Demo agents (fields: reason, summary, call_language, ...)
 // Reads a `client_id` from the call and sends results to THAT client's
-// email + Slack (see CLIENTS below). One webhook serves every client.
+// email + Slack (looked up in Supabase — see ./supabase-clients.js).
+// One webhook serves every client.
 //
 // Deploy to Railway/Render, paste public URL + /vapi-intake into each
 // assistant's Server URL. Env vars:
@@ -12,6 +13,7 @@
 
 import express from "express";
 import { storeCall } from "./supabase-store.js";
+import { getClient, slackUrlFor } from "./supabase-clients.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -25,9 +27,10 @@ const {
 } = process.env;
 
 // ─────────────────────────────────────────────────────────────
-// CLIENT REGISTRY — mirror your client_registry.csv here.
-// Add one entry per client. `emailTo` accepts comma-separated addresses.
-// When you outgrow this (many clients), swap this object for a DB lookup.
+// CLIENT REGISTRY — SUPERSEDED by the `clients` table in Supabase.
+// Routing now goes through getClient() in ./supabase-clients.js.
+// Kept here, unused, as a reference for the old destinations.
+// Add new clients to the database, not to this object.
 // ─────────────────────────────────────────────────────────────
 const CLIENTS = {
   azzawi: {
@@ -44,11 +47,19 @@ const CLIENTS = {
 };
 
 // Resolve a client_id (sent from Vapi) to its destination, with a safe fallback.
-function resolveClient(clientId) {
-  const c = clientId && CLIENTS[clientId];
-  if (c) return c;
+// Looks the client up in Supabase; getClient() never throws and degrades through
+// its own cache/fallback layers, so a DB outage can't lose an intake.
+async function resolveClient(clientId) {
+  const c = await getClient(clientId);
+  if (c) {
+    return {
+      name: c.name || clientId,
+      emailTo: c.email_to || INTAKE_EMAIL_TO,
+      slack: slackUrlFor(c, clientId),
+    };
+  }
   // Unknown / missing client_id → fall back to your own inbox so nothing is lost.
-  return { name: clientId || "Unrouted", emailTo: INTAKE_EMAIL_TO, slack: SLACK_WEBHOOK_URL };
+  return { name: clientId || "Unrouted", emailTo: INTAKE_EMAIL_TO, slack: slackUrlFor(null, clientId) };
 }
 
 const MATTER_LABELS = {
@@ -106,7 +117,7 @@ app.post("/vapi-intake", async (req, res) => {
         : "[client] no client_id in payload or query — using fallback destination"
     );
 
-    const client = resolveClient(clientId);
+    const client = await resolveClient(clientId);
 
     // ---- which agent type sent this ----
     const kind = data.matter_type || data.matter_summary ? "immigration"

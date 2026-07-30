@@ -14,6 +14,7 @@
 import express from "express";
 import { storeCall } from "./supabase-store.js";
 import { getClient, slackUrlFor } from "./supabase-clients.js";
+import { alertOwner } from "./webhook-alerts.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -59,6 +60,7 @@ async function resolveClient(clientId) {
     };
   }
   // Unknown / missing client_id → fall back to your own inbox so nothing is lost.
+  alertOwner("unknown_client", { clientId, note: "fell back to default inbox" }).catch(() => {});
   return { name: clientId || "Unrouted", emailTo: INTAKE_EMAIL_TO, slack: slackUrlFor(null, clientId) };
 }
 
@@ -73,6 +75,10 @@ const MATTER_LABELS = {
 };
 
 app.post("/vapi-intake", async (req, res) => {
+  // Hoisted out of the try so the catch below can attribute a crash to a call.
+  let clientId = null;
+  let callId = null;
+
   try {
     if (VAPI_SECRET && req.headers["x-vapi-secret"] !== VAPI_SECRET) {
       return res.status(401).send("unauthorized");
@@ -90,6 +96,7 @@ app.post("/vapi-intake", async (req, res) => {
       message?.transcript ?? message?.artifact?.transcript ?? "";
     const assistantName =
       message?.assistant?.name ?? message?.call?.assistantId ?? "";
+    callId = message?.call?.id ?? message?.id ?? null;
 
     // ---- which client is this? ----
     // Set `client_id` as assistant metadata / a variable value in Vapi.
@@ -109,7 +116,7 @@ app.post("/vapi-intake", async (req, res) => {
     };
     const fromPayload = cleanId(payloadClientId);
     const fromQuery = cleanId(req.query?.client_id);
-    const clientId = fromPayload || fromQuery || null;
+    clientId = fromPayload || fromQuery || null;
 
     console.log(
       clientId
@@ -124,12 +131,24 @@ app.post("/vapi-intake", async (req, res) => {
                : data.reason || data.summary ? "general"
                : "unknown";
 
+    if (kind === "unknown") {
+      alertOwner("unrecognized_payload", { clientId, callId }).catch(() => {});
+    }
+
     const isUrgent = String(data.urgency || "").toUpperCase() === "URGENT";
 
-    await Promise.allSettled([
+    const [slackResult, emailResult] = await Promise.allSettled([
       sendSlack({ client, kind, data, isUrgent, recordingUrl, assistantName }),
       sendEmail({ client, kind, data, isUrgent, recordingUrl, transcript, assistantName }),
     ]);
+
+    // allSettled already swallowed these — alert, but never fail the request.
+    if (slackResult.status === "rejected") {
+      alertOwner("slack_failed", { clientId, callId, error: slackResult.reason }).catch(() => {});
+    }
+    if (emailResult.status === "rejected") {
+      alertOwner("email_failed", { clientId, callId, error: emailResult.reason }).catch(() => {});
+    }
 
     // Additive: persist the call. Never throws; email/Slack above are unaffected.
     await storeCall({ message, data, clientId, agentType: kind });
@@ -137,6 +156,7 @@ app.post("/vapi-intake", async (req, res) => {
     return res.status(200).send("ok");
   } catch (err) {
     console.error("Webhook error:", err);
+    alertOwner("webhook_error", { clientId, callId, error: err }).catch(() => {});
     return res.status(200).send("error-logged");
   }
 });
@@ -202,11 +222,18 @@ async function sendSlack({ client, kind, data, isUrgent, recordingUrl, assistant
     blocks: [{ type: "section", text: { type: "mrkdwn", text: lines.filter(Boolean).join("\n") } }],
   };
 
-  await fetch(slackUrl, {
+  const resp = await fetch(slackUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+
+  // A dropped Slack post answers non-2xx rather than throwing. Surface it so
+  // the caller can alert; Promise.allSettled above keeps it off the request path.
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`slack ${resp.status} ${body}`.trim());
+  }
 }
 
 /* ============================ EMAIL ============================ */
@@ -286,7 +313,7 @@ async function sendEmail({ client, kind, data, isUrgent, recordingUrl, transcrip
     </div>`;
   }
 
-  await fetch("https://api.resend.com/emails", {
+  const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${RESEND_API_KEY}`,
@@ -299,7 +326,18 @@ async function sendEmail({ client, kind, data, isUrgent, recordingUrl, transcrip
       html,
     }),
   });
+
+  // Resend rejects (bad key, unverified domain, bad address) with a 4xx body,
+  // not an exception — that silent failure is the one worth alerting on.
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`resend ${resp.status} ${body}`.trim());
+  }
 }
+
+/* ============================ HEALTH ============================ */
+
+app.get('/health', (req,res)=>res.status(200).json({ ok:true, at:new Date().toISOString() }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Intake webhook v2 listening on :${PORT}`));

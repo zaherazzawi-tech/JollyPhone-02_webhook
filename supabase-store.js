@@ -8,6 +8,7 @@
 // ============================================================
 
 import { createClient } from '@supabase/supabase-js';
+import { alertOwner } from './webhook-alerts.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -102,6 +103,11 @@ export async function storeCall({ message = {}, data = {}, clientId, agentType =
 
     if (error) {
       console.error('[supabase] insert failed:', error.message);
+      alertOwner('store_failed', {
+        clientId,
+        callId: row.vapi_call_id,
+        error: error.message
+      }).catch(() => {});
       return false;
     }
 
@@ -110,6 +116,11 @@ export async function storeCall({ message = {}, data = {}, clientId, agentType =
 
   } catch (err) {
     console.error('[supabase] unexpected error:', err.message);
+    alertOwner('store_failed', {
+      clientId,
+      callId: (message.call && message.call.id) || message.id || null,
+      error: err.message
+    }).catch(() => {});
     return false;
   }
 }

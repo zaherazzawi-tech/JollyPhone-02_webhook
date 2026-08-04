@@ -15,6 +15,7 @@ import express from "express";
 import { storeCall } from "./supabase-store.js";
 import { getClient, slackUrlFor } from "./supabase-clients.js";
 import { alertOwner } from "./webhook-alerts.js";
+import { createCloverOrder, cloverStatusHtml, cloverStatusSlack } from "./clover.js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -127,7 +128,10 @@ app.post("/vapi-intake", async (req, res) => {
     const client = await resolveClient(clientId);
 
     // ---- which agent type sent this ----
+    // Order payloads carry `summary` too, so they must be checked BEFORE
+    // the general branch or they'd be misfiled as ordinary calls.
     const kind = data.matter_type || data.matter_summary ? "immigration"
+               : Array.isArray(data.order_items) || data.order_confirmed !== undefined ? "order"
                : data.reason || data.summary ? "general"
                : "unknown";
 
@@ -135,11 +139,24 @@ app.post("/vapi-intake", async (req, res) => {
       alertOwner("unrecognized_payload", { clientId, callId }).catch(() => {});
     }
 
-    const isUrgent = String(data.urgency || "").toUpperCase() === "URGENT";
+    // Push to the POS before notifying, so the email can report what happened.
+    // createCloverOrder never throws and refuses rather than guessing.
+    let cloverResult = null;
+    if (kind === "order") {
+      cloverResult = await createCloverOrder(clientId, data);
+      if (!cloverResult.ok) {
+        alertOwner("clover_not_sent", { clientId, callId, reason: cloverResult.reason }).catch(() => {});
+      }
+    }
+
+    // An order that didn't reach the POS needs a human now — treat it as urgent.
+    const isUrgent =
+      String(data.urgency || "").toUpperCase() === "URGENT" ||
+      (kind === "order" && cloverResult && !cloverResult.ok);
 
     const [slackResult, emailResult] = await Promise.allSettled([
-      sendSlack({ client, kind, data, isUrgent, recordingUrl, assistantName }),
-      sendEmail({ client, kind, data, isUrgent, recordingUrl, transcript, assistantName }),
+      sendSlack({ client, kind, data, isUrgent, recordingUrl, assistantName, cloverResult }),
+      sendEmail({ client, kind, data, isUrgent, recordingUrl, transcript, assistantName, cloverResult }),
     ]);
 
     // allSettled already swallowed these — alert, but never fail the request.
@@ -175,7 +192,16 @@ function extractData(msg) {
 
 /* ============================ SLACK ============================ */
 
-async function sendSlack({ client, kind, data, isUrgent, recordingUrl, assistantName }) {
+// "2x Gyro Plate — no onions" per line, for Slack/email order listings.
+function orderItemLines(data) {
+  return (data.order_items || []).map((i) => {
+    const mods = (i.modifiers || []).join(", ");
+    const size = i.size ? ` (${i.size})` : "";
+    return `${i.quantity || 1}x ${i.item_name || "—"}${size}${mods ? ` — ${mods}` : ""}`;
+  });
+}
+
+async function sendSlack({ client, kind, data, isUrgent, recordingUrl, assistantName, cloverResult }) {
   const slackUrl = client?.slack;
   if (!slackUrl) return;
 
@@ -193,6 +219,27 @@ async function sendSlack({ client, kind, data, isUrgent, recordingUrl, assistant
       data.existing_client ? "*Existing client*" : "*New matter*",
       "",
       `*Summary:* ${data.matter_summary || "—"}`,
+      recordingUrl ? `<${recordingUrl}|Listen to recording>` : null,
+    ];
+  } else if (kind === "order") {
+    const items = orderItemLines(data);
+    lines = [
+      cloverResult && !cloverResult.ok
+        ? ":rotating_light: *ORDER NEEDS MANUAL ENTRY* :rotating_light:"
+        : ":shallow_pan_of_food: New order",
+      `*Name:* ${data.caller_name || "—"}`,
+      `*Callback:* ${data.callback_number || "—"}`,
+      `*Type:* ${data.order_type || "pickup"}${data.pickup_time_minutes ? ` — ~${data.pickup_time_minutes} min` : ""}`,
+      "",
+      items.length ? items.map((l) => `• ${l}`).join("\n") : "_no items captured_",
+      data.order_total ? `*Quoted total:* $${Number(data.order_total).toFixed(2)}` : null,
+      data.special_instructions ? `*Kitchen notes:* ${data.special_instructions}` : null,
+      (data.unmatched_requests || []).length
+        ? `:warning: *Unmatched:* ${data.unmatched_requests.join(", ")}`
+        : null,
+      data.order_confirmed === false ? ":warning: *Caller never confirmed the read-back*" : null,
+      "",
+      cloverStatusSlack(cloverResult),
       recordingUrl ? `<${recordingUrl}|Listen to recording>` : null,
     ];
   } else if (kind === "general") {
@@ -243,7 +290,7 @@ const row = (label, val) =>
     ? `<tr><td style="padding:4px 12px 4px 0;color:#666;">${label}</td><td style="padding:4px 0;font-weight:600;">${val}</td></tr>`
     : "";
 
-async function sendEmail({ client, kind, data, isUrgent, recordingUrl, transcript, assistantName }) {
+async function sendEmail({ client, kind, data, isUrgent, recordingUrl, transcript, assistantName, cloverResult }) {
   const emailTo = client?.emailTo;
   if (!RESEND_API_KEY || !emailTo || !INTAKE_EMAIL_FROM) return;
 
@@ -277,6 +324,46 @@ async function sendEmail({ client, kind, data, isUrgent, recordingUrl, transcrip
       ${data.qualifying_answers ? `<h3 style="margin:16px 0 4px;">Qualifying details</h3><p style="margin:0;line-height:1.5;">${data.qualifying_answers}</p>` : ""}
       ${questions.length ? `<h3 style="margin:16px 0 4px;">Open questions for attorney</h3><ul>${questions.map((q) => `<li>${q}</li>`).join("")}</ul>` : ""}
       ${data.final_note ? `<h3 style="margin:16px 0 4px;">Caller's closing note</h3><p style="margin:0;line-height:1.5;">${data.final_note}</p>` : ""}
+      ${recordingUrl ? `<p style="margin:16px 0 0;"><a href="${recordingUrl}">Listen to recording</a></p>` : ""}
+      ${transcript ? `<details style="margin-top:16px;"><summary style="cursor:pointer;color:#666;">Full transcript</summary><pre style="white-space:pre-wrap;font-size:13px;color:#333;">${transcript}</pre></details>` : ""}
+    </div>`;
+  } else if (kind === "order") {
+    const items = orderItemLines(data);
+    const needsHuman = cloverResult && !cloverResult.ok;
+
+    subject =
+      (needsHuman ? "[ACTION NEEDED] " : "") +
+      `Phone order — ${data.caller_name || "Unknown caller"}` +
+      (data.pickup_time_minutes ? ` — ${data.pickup_time_minutes} min` : "");
+
+    html = `
+    <div style="font-family:system-ui,Arial,sans-serif;max-width:640px;color:#111;">
+      ${cloverStatusHtml(cloverResult)}
+      <h2 style="margin:0 0 4px;">Phone Order — ${data.caller_name || "Unknown caller"}</h2>
+      <table style="border-collapse:collapse;margin:12px 0;">
+        ${row("Callback", data.callback_number)}
+        ${row("Type", data.order_type || "pickup")}
+        ${row("Ready in", data.pickup_time_minutes ? `${data.pickup_time_minutes} min` : "")}
+        ${row("Quoted total", data.order_total ? `$${Number(data.order_total).toFixed(2)}` : "")}
+      </table>
+      <h3 style="margin:16px 0 4px;">Items</h3>
+      ${items.length
+        ? `<ul style="margin:0;padding-left:20px;line-height:1.7;">${items.map((l) => `<li>${l}</li>`).join("")}</ul>`
+        : `<p style="margin:0;color:#666;">No items captured.</p>`}
+      ${data.special_instructions
+        ? `<h3 style="margin:16px 0 4px;">Kitchen notes</h3><p style="margin:0;line-height:1.5;">${data.special_instructions}</p>`
+        : ""}
+      ${(data.unmatched_requests || []).length
+        ? `<div style="margin:16px 0;padding:10px 14px;background:#fdecea;border-left:4px solid #b00020;">
+             <strong style="color:#b00020;">Could not match these requests — call the customer</strong>
+             <ul style="margin:6px 0 0;padding-left:20px;">${data.unmatched_requests.map((u) => `<li>${u}</li>`).join("")}</ul>
+           </div>`
+        : ""}
+      ${data.order_confirmed === false
+        ? `<p style="margin:12px 0;color:#b00020;font-weight:600;">⚠ The caller never confirmed the read-back — verify before preparing.</p>`
+        : ""}
+      <h3 style="margin:16px 0 4px;">Summary</h3>
+      <p style="margin:0;line-height:1.5;">${data.summary || "—"}</p>
       ${recordingUrl ? `<p style="margin:16px 0 0;"><a href="${recordingUrl}">Listen to recording</a></p>` : ""}
       ${transcript ? `<details style="margin-top:16px;"><summary style="cursor:pointer;color:#666;">Full transcript</summary><pre style="white-space:pre-wrap;font-size:13px;color:#333;">${transcript}</pre></details>` : ""}
     </div>`;

@@ -21,9 +21,9 @@ const CLOVER_BASE =
 // Keyed by the same client_id the webhook already resolves.
 // Menu keys must match the assistant prompt's menu exactly (lowercased here).
 export const CLOVER_CLIENTS = {
-  demo_gyro: {
+  wowkabab: {
     merchantId: "0N7Q6GEDRPSB1",
-    tokenEnv: "CLOVER_TOKEN_DEMO_GYRO",
+    tokenEnv: "CLOVER_TOKEN_WOWKABAB",
     menu: {
       "gyro plate": "NHE8K6W4FCRYW",
       "chicken plate": "ZMZ3S0M80JDYP",
